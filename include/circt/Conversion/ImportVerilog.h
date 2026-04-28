@@ -177,6 +177,14 @@ struct LlhdToCorePipelineOptions
       llvm::cl::desc("Destructure arrays and structs into individual signals. "
                      "See https://github.com/llvm/circt/issues/8804."),
       llvm::cl::init(false)};
+  Option<std::string> externalReset{
+      *this, "external-reset",
+      llvm::cl::desc("External module input to use as a reset hint."),
+      llvm::cl::init("")};
+  Option<bool> externalResetActiveLow{
+      *this, "external-reset-active-low",
+      llvm::cl::desc("Treat the external reset hint as active-low."),
+      llvm::cl::init(false)};
 };
 void populateLlhdToCorePipeline(mlir::OpPassManager &pm,
                                 const LlhdToCorePipelineOptions &options);

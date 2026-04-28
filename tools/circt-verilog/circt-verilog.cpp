@@ -134,6 +134,16 @@ struct CLOptions {
       cl::desc("Detect memories and lower them to `seq.firmem`"),
       cl::init(true), cl::cat(cat)};
 
+  cl::opt<std::string> externalReset{
+      "reset", cl::desc("External module input to use as a reset hint."),
+      cl::value_desc("input"), cl::cat(cat)};
+
+  cl::opt<bool> externalResetActiveLow{
+      "reset-active-low",
+      cl::desc("Treat the external reset hint as active-low. Only valid with "
+               "`--reset`."),
+      cl::init(false), cl::cat(cat)};
+
   cl::opt<bool> sroa{
       "sroa",
       cl::desc("Destructure arrays and structs into individual signals."),
@@ -287,6 +297,14 @@ struct CLOptions {
 
 static CLOptions opts;
 
+static LogicalResult validateCommandLineOptions() {
+  if (opts.externalReset.empty() && opts.externalResetActiveLow) {
+    WithColor::error() << "`--reset-active-low` requires `--reset`\n";
+    return failure();
+  }
+  return success();
+}
+
 /// Populate the given pass manager with transformations as configured by the
 /// command line options.
 static void populatePasses(PassManager &pm) {
@@ -299,6 +317,8 @@ static void populatePasses(PassManager &pm) {
   LlhdToCorePipelineOptions options;
   options.detectMemories = opts.detectMemories;
   options.sroa = opts.sroa;
+  options.externalReset = opts.externalReset;
+  options.externalResetActiveLow = opts.externalResetActiveLow;
   populateLlhdToCorePipeline(pm, options);
 }
 
@@ -510,6 +530,8 @@ int main(int argc, char **argv) {
   // Parse pass names in main to ensure static initialization completed.
   cl::ParseCommandLineOptions(argc, argv,
                               "Verilog and SystemVerilog frontend\n");
+  if (failed(validateCommandLineOptions()))
+    return 1;
 
   // Register the dialects.
   // clang-format off

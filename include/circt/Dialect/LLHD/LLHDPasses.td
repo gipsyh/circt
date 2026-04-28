@@ -62,6 +62,12 @@ def DeseqPass : Pass<"llhd-deseq", "hw::HWModuleOp"> {
     "hw::HWDialect",
     "seq::SeqDialect",
   ];
+  let options = [
+    Option<"externalReset", "external-reset", "std::string", "\"\"",
+           "External module input to use as a reset hint.">,
+    Option<"externalResetActiveLow", "external-reset-active-low", "bool",
+           "false", "Treat the external reset hint as active-low.">
+  ];
 }
 
 def CombineDrivesPass : Pass<"llhd-combine-drives", "hw::HWModuleOp"> {

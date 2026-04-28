@@ -199,9 +199,84 @@ static ValueField getValueField(Value value) {
   return {value, 0, value};
 }
 
+struct ExternalResetSpec {
+  bool activeHigh = true;
+  std::string inputName;
+};
+
+struct ExternalReset {
+  bool activeHigh = true;
+  Value value;
+  SmallVector<ValueField, 4> aliases;
+};
+
+static std::optional<ExternalResetSpec>
+parseExternalResetSpec(StringRef spec, bool activeLow, Operation *op) {
+  spec = spec.trim();
+  if (spec.empty())
+    return std::nullopt;
+
+  ExternalResetSpec result;
+  result.activeHigh = !activeLow;
+  result.inputName = spec.str();
+  return result;
+}
+
+static std::optional<ExternalReset>
+resolveExternalReset(hw::HWModuleOp module, const ExternalResetSpec &spec) {
+  ExternalReset result;
+  result.activeHigh = spec.activeHigh;
+
+  hw::ModulePortInfo ports(module.getPortList());
+  Block *body = module.getBodyBlock();
+
+  Value input;
+  for (auto [index, port] : llvm::enumerate(ports.getInputs())) {
+    if (port.name.getValue() != spec.inputName)
+      continue;
+    input = body->getArgument(index);
+    break;
+  }
+  if (!input || !input.getType().isSignlessInteger(1))
+    return std::nullopt;
+
+  result.value = input;
+
+  auto addAlias = [&](Value value) {
+    if (!value || !value.getType().isSignlessInteger(1))
+      return;
+    auto vf = getValueField(value);
+    if (!llvm::is_contained(result.aliases, vf))
+      result.aliases.push_back(vf);
+  };
+  addAlias(input);
+
+  // The import pipeline materializes module inputs as LLHD signals before
+  // hoisting probes out of processes. Match the requested input only through
+  // those direct drives; do not invent or add new module ports.
+  for (auto *user : input.getUsers()) {
+    auto drive = dyn_cast<DriveOp>(user);
+    if (!drive || drive.getValue() != input)
+      continue;
+    auto signal = drive.getSignal().getDefiningOp<SignalOp>();
+    if (!signal)
+      continue;
+    for (auto *signalUser : signal.getResult().getUsers()) {
+      auto probe = dyn_cast<ProbeOp>(signalUser);
+      if (!probe)
+        continue;
+      result.value = probe.getResult();
+      addAlias(probe.getResult());
+    }
+  }
+
+  return result;
+}
+
 /// The work horse promoting processes into concrete registers.
 struct Deseq {
-  Deseq(ProcessOp process) : process(process) {}
+  Deseq(ProcessOp process, std::optional<ExternalReset> externalReset)
+      : process(process), externalReset(std::move(externalReset)) {}
   void deseq();
 
   bool analyzeProcess();
@@ -219,6 +294,7 @@ struct Deseq {
   TruthTable computeSuccessorBoolean(BlockOperand &operand, unsigned argIdx);
   ValueTable computeSuccessorValue(BlockOperand &operand, unsigned argIdx);
 
+  void seedDataFlowAnalysis();
   bool matchDrives();
   bool matchDrive(DriveInfo &drive);
   bool matchDriveClock(DriveInfo &drive,
@@ -226,6 +302,8 @@ struct Deseq {
   bool
   matchDriveClockAndReset(DriveInfo &drive,
                           ArrayRef<std::pair<DNFTerm, ValueEntry>> valueTable);
+  bool matchDriveClockAndExternalSyncReset(
+      DriveInfo &drive, ArrayRef<std::pair<DNFTerm, ValueEntry>> valueTable);
 
   Value materializeProjection(OpBuilder &builder, Location loc, Value value,
                               SmallDenseMap<Value, Value, 8> &cache);
@@ -238,6 +316,8 @@ struct Deseq {
 
   /// The process we are desequentializing.
   ProcessOp process;
+  /// Optional reset hint from a module input.
+  std::optional<ExternalReset> externalReset;
   /// The single wait op of the process.
   WaitOp wait;
   /// The boolean values observed by the wait. These trigger the process and
@@ -287,18 +367,29 @@ private:
   // Utilities to create boolean truth tables. These make working with truth
   // tables easier, since the calling code doesn't have to care about how
   // triggers and unknown value markers are packed into truth table columns.
+  bool hasExternalResetTerm() const {
+    return triggers.size() == 1 && externalReset.has_value();
+  }
+  unsigned getNumBooleanTerms() const {
+    return triggers.size() * 2 + 1 + (hasExternalResetTerm() ? 1 : 0);
+  }
   TruthTable getPoisonBoolean() const { return TruthTable::getPoison(); }
   TruthTable getUnknownBoolean() const {
-    return TruthTable::getTerm(triggers.size() * 2 + 1, 0);
+    return TruthTable::getTerm(getNumBooleanTerms(), 0);
   }
   TruthTable getConstBoolean(bool value) const {
-    return TruthTable::getConst(triggers.size() * 2 + 1, value);
+    return TruthTable::getConst(getNumBooleanTerms(), value);
   }
   TruthTable getPastTrigger(unsigned triggerIndex) const {
-    return TruthTable::getTerm(triggers.size() * 2 + 1, triggerIndex * 2 + 1);
+    return TruthTable::getTerm(getNumBooleanTerms(), triggerIndex * 2 + 1);
   }
   TruthTable getPresentTrigger(unsigned triggerIndex) const {
-    return TruthTable::getTerm(triggers.size() * 2 + 1, triggerIndex * 2 + 2);
+    return TruthTable::getTerm(getNumBooleanTerms(), triggerIndex * 2 + 2);
+  }
+  unsigned getExternalResetTermIndex() const { return triggers.size() * 2 + 1; }
+  TruthTable getExternalResetActive() const {
+    return TruthTable::getTerm(getNumBooleanTerms(),
+                               getExternalResetTermIndex());
   }
 
   // Utilities to create value tables. These make working with value tables
@@ -462,10 +553,6 @@ bool Deseq::analyzeProcess() {
                             << triggers.size() << " values\n");
     return false;
   }
-
-  // Seed the drive value analysis with the triggers.
-  for (auto [index, trigger] : llvm::enumerate(triggers))
-    booleanLattice.insert({trigger, getPresentTrigger(index)});
 
   // Process the wait op destination operands, i.e. the values passed from the
   // past into the present. For projected clocks, the dest operand itself may be
@@ -1003,10 +1090,43 @@ ValueTable Deseq::computeSuccessorValue(BlockOperand &blockOperand,
 /// behaviors. Returns false if any of the drives cannot be implemented as a
 /// register.
 bool Deseq::matchDrives() {
+  seedDataFlowAnalysis();
+
   for (auto &drive : driveInfos)
     if (!matchDrive(drive))
       return false;
   return true;
+}
+
+void Deseq::seedDataFlowAnalysis() {
+  specializedProcesses.clear();
+  booleanLattice.clear();
+  valueLattice.clear();
+  blockConditionLattice.clear();
+  successorConditionLattice.clear();
+  successorBooleanLattice.clear();
+  successorValueLattice.clear();
+
+  for (auto [index, trigger] : llvm::enumerate(triggers))
+    booleanLattice.insert({trigger, getPresentTrigger(index)});
+
+  for (auto [arg, pastValue] :
+       llvm::zip(wait.getDest()->getArguments(), pastValues)) {
+    auto it = llvm::find(triggers, getValueField(pastValue));
+    if (it == triggers.end())
+      continue;
+    unsigned index = std::distance(triggers.begin(), it);
+    booleanLattice.insert({getValueField(arg), getPastTrigger(index)});
+  }
+
+  if (!hasExternalResetTerm())
+    return;
+
+  TruthTable resetActive = getExternalResetActive();
+  TruthTable resetSignal =
+      externalReset->activeHigh ? resetActive : ~resetActive;
+  for (auto alias : externalReset->aliases)
+    booleanLattice.insert({alias, resetSignal});
 }
 
 /// For a given drive op, determine if its drive condition and driven value as
@@ -1057,11 +1177,28 @@ bool Deseq::matchDrive(DriveInfo &drive) {
   }
 
   // If we have two triggers, one of them must be the reset.
-  if (triggers.size() == 2)
-    return matchDriveClockAndReset(drive, valueTable);
+  if (triggers.size() == 2) {
+    if (!matchDriveClockAndReset(drive, valueTable))
+      return false;
+    if (externalReset.has_value()) {
+      // If an external reset hint is present, require the inferred async reset
+      // to match the hinted input and polarity.
+      auto resetVF = getValueField(drive.reset.reset);
+      if (drive.reset.activeHigh != externalReset->activeHigh ||
+          !llvm::is_contained(externalReset->aliases, resetVF)) {
+        LLVM_DEBUG(
+            llvm::dbgs()
+            << "- Aborting: async reset does not match external reset\n");
+        return false;
+      }
+    }
+    return true;
+  }
 
   // Otherwise we only have a single trigger, which is the clock.
   assert(triggers.size() == 1);
+  if (externalReset.has_value())
+    return matchDriveClockAndExternalSyncReset(drive, valueTable);
   return matchDriveClock(drive, valueTable);
 }
 
@@ -1191,6 +1328,7 @@ bool Deseq::matchDriveClockAndReset(
     drive.reset.reset = triggers[resetIdx].getProjected();
     drive.reset.value = resetIt->second.value;
     drive.reset.activeHigh = !negReset;
+    drive.reset.isAsync = true;
 
     drive.clock.clock = triggers[clockIdx].getProjected();
     drive.clock.risingEdge = !negClock;
@@ -1218,6 +1356,73 @@ bool Deseq::matchDriveClockAndReset(
 
   // If we arrive here, none of the patterns we tried matched.
   LLVM_DEBUG(llvm::dbgs() << "- Aborting: unknown reset scheme\n");
+  return false;
+}
+
+/// Assuming one trigger and an external sync reset hint, detect the synchronous
+/// reset scheme represented by a value table and store the result in
+/// `drive.reset` and `drive.clock`.
+bool Deseq::matchDriveClockAndExternalSyncReset(
+    DriveInfo &drive, ArrayRef<std::pair<DNFTerm, ValueEntry>> valueTable) {
+  // We need two entries: clock edge while reset is active and clock edge while
+  // reset is inactive, with the inactive case optionally gated by an enable.
+  if (valueTable.size() != 2) {
+    LLVM_DEBUG(llvm::dbgs() << "- Aborting: sync reset value table has "
+                            << valueTable.size() << " entries\n");
+    return false;
+  }
+
+  auto resetTerm = getExternalResetTermIndex();
+  uint32_t resetOn = 1u << (resetTerm * 2);
+  uint32_t resetOff = 1u << (resetTerm * 2 + 1);
+
+  for (unsigned variant = 0; variant < (1 << 1); ++variant) {
+    bool negClock = (variant >> 0) & 1;
+
+    uint32_t clockEdge = (negClock ? 0b1001 : 0b0110) << 2;
+    auto reset = DNFTerm{clockEdge | resetOn};
+    auto clockWithoutEnable = DNFTerm{clockEdge | resetOff};
+    auto clockWithEnable = DNFTerm{clockEdge | resetOff | 0b01};
+
+    auto resetIt = llvm::find_if(
+        valueTable, [&](auto &pair) { return pair.first == reset; });
+    if (resetIt == valueTable.end() || resetIt->second.isUnknown())
+      continue;
+
+    auto clockIt = llvm::find_if(valueTable, [&](auto &pair) {
+      return pair.first == clockWithoutEnable || pair.first == clockWithEnable;
+    });
+    if (clockIt == valueTable.end())
+      continue;
+
+    drive.reset.reset = externalReset->value;
+    drive.reset.value = resetIt->second.value;
+    drive.reset.activeHigh = externalReset->activeHigh;
+    drive.reset.isAsync = false;
+
+    drive.clock.clock = triggers[0].getProjected();
+    drive.clock.risingEdge = !negClock;
+    if (clockIt->first == clockWithEnable)
+      drive.clock.enable = drive.op.getEnable();
+    drive.clock.value = drive.op.getValue();
+    if (!clockIt->second.isUnknown())
+      drive.clock.value = clockIt->second.value;
+
+    LLVM_DEBUG({
+      llvm::dbgs() << "  - Matched " << (negClock ? "neg" : "pos")
+                   << "edge clock ";
+      drive.clock.clock.printAsOperand(llvm::dbgs(), OpPrintingFlags());
+      llvm::dbgs() << " with external sync reset ";
+      drive.reset.reset.printAsOperand(llvm::dbgs(), OpPrintingFlags());
+      llvm::dbgs() << " -> " << resetIt->second;
+      if (drive.clock.enable)
+        llvm::dbgs() << " (with enable)";
+      llvm::dbgs() << "\n";
+    });
+    return true;
+  }
+
+  LLVM_DEBUG(llvm::dbgs() << "- Aborting: unknown sync reset scheme\n");
   return false;
 }
 
@@ -1382,7 +1587,8 @@ void Deseq::implementRegister(DriveInfo &drive) {
         resetValue = specializeValue(
             drive.op.getValue(),
             FixedValues{{drive.clock.clock, !drive.clock.risingEdge,
-                         !drive.clock.risingEdge},
+                         drive.reset.isAsync ? !drive.clock.risingEdge
+                                             : drive.clock.risingEdge},
                         {drive.reset.reset, !drive.reset.activeHigh,
                          drive.reset.activeHigh}});
     }
@@ -1431,7 +1637,7 @@ void Deseq::implementRegister(DriveInfo &drive) {
   auto reg = seq::FirRegOp::create(builder, loc, value, clock, name,
                                    hw::InnerSymAttr{},
                                    /*preset=*/IntegerAttr{}, reset, resetValue,
-                                   /*isAsync=*/reset != Value{});
+                                   /*isAsync=*/drive.reset.isAsync);
 
   // If the register has an enable, insert a self-mux in front of the register.
   // Set the `bin` flag on the mux specifically to make up for a subtle
@@ -1688,12 +1894,18 @@ ValueRange Deseq::specializeProcess(FixedValues fixedValues) {
 
 namespace {
 struct DeseqPass : public llhd::impl::DeseqPassBase<DeseqPass> {
+  using DeseqPassBase<DeseqPass>::DeseqPassBase;
   void runOnOperation() override;
 };
 } // namespace
 
 void DeseqPass::runOnOperation() {
+  auto spec = parseExternalResetSpec(externalReset, externalResetActiveLow,
+                                     getOperation());
+  std::optional<ExternalReset> reset;
+  if (spec)
+    reset = resolveExternalReset(getOperation(), *spec);
   SmallVector<ProcessOp> processes(getOperation().getOps<ProcessOp>());
   for (auto process : processes)
-    Deseq(process).deseq();
+    Deseq(process, reset).deseq();
 }

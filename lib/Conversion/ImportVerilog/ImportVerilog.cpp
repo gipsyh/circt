@@ -523,7 +523,10 @@ void circt::populateLlhdToCorePipeline(
   }
   modulePM.addPass(llhd::createMem2RegPass());
   modulePM.addPass(llhd::createHoistSignalsPass());
-  modulePM.addPass(llhd::createDeseqPass());
+  llhd::DeseqPassOptions deseqOptions;
+  deseqOptions.externalReset = options.externalReset;
+  deseqOptions.externalResetActiveLow = options.externalResetActiveLow;
+  modulePM.addPass(llhd::createDeseqPass(deseqOptions));
   modulePM.addPass(llhd::createLowerProcessesPass());
   modulePM.addPass(mlir::createCSEPass());
   modulePM.addPass(mlir::createCanonicalizerPass());

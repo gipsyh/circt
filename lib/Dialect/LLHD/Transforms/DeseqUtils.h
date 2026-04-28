@@ -226,7 +226,9 @@ struct ResetInfo {
   /// The value the register is reset to.
   Value value;
   /// Whether the reset is active when high.
-  bool activeHigh;
+  bool activeHigh = true;
+  /// Whether the reset is asynchronous.
+  bool isAsync = false;
 
   /// Check if this reset info is null.
   operator bool() const { return bool(reset); }
